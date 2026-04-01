@@ -81,8 +81,8 @@ async def handle_create_order(phone: str, args: dict, receipt_bytes: bytes = Non
         user_id = user["id"]
     except Exception as e:
         logger.error(f"Error creating user in DB: {e}")
-        from src import sendpulse as sp
-        await sp.send_message(phone, "Техническая ошибка связи с базой данных. Пожалуйста, повторите через пару минут 🙁")
+        from src import wazzup as wz
+        await wz.send_message(phone, "Техническая ошибка связи с базой данных. Пожалуйста, повторите через пару минут 🙁")
         return None, None
 
     positions = args.get("positions", [])
@@ -104,8 +104,8 @@ async def handle_create_order(phone: str, args: dict, receipt_bytes: bytes = Non
         )
     except Exception as e:
         logger.error(f"Error creating order in DB: {e}")
-        from src import sendpulse as sp
-        await sp.send_message(phone, "Техническая ошибка создания заказа. Пожалуйста, повторите через пару минут 🙁")
+        from src import wazzup as wz
+        await wz.send_message(phone, "Техническая ошибка создания заказа. Пожалуйста, повторите через пару минут 🙁")
         return None, None
     order_id = order["id"]
     daily_id = order.get("daily_number", order_id)

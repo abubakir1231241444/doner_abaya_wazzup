@@ -19,7 +19,7 @@ import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.config import CASHIER_BOT_TOKEN, CASHIER_TG_IDS
-from src import db, sendpulse as sp
+from src import db, wazzup as wz
 from src.menu_builder import get_stoplist_grouped
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -328,7 +328,7 @@ async def accept_order(cb: CallbackQuery):
     dtype = order["delivery_type"] if order else "takeaway"
 
     # Уведомить клиента
-    await sp.send_message(phone, "Ваш заказ принят в работу! Готовим 🌯")
+    await wz.send_message(phone, "Ваш заказ принят в работу! Готовим 🌯")
 
     # Убираем старый текст с кнопками Accept/Reject и заменяем на новый статус
     # Извлекаем оригинальный текст заказа (до возможных прошлых статусов)
@@ -371,7 +371,7 @@ async def delay_order(cb: CallbackQuery):
     parts = cb.data.split("_")
     phone = parts[2]
     msg = "Приносим извинения, ваш заказ задерживается примерно на 10 минут. Мы уже очень торопимся! 🥙"
-    await sp.send_message(phone, msg)
+    await wz.send_message(phone, msg)
     await cb.answer("✅ Клиент уведомлен о задержке!")
 
 
@@ -391,8 +391,24 @@ async def ready_order(cb: CallbackQuery):
         "client_courier": "Ваш заказ готов! Передаём вашему курьеру 📦",
     }
     text = messages.get(dtype, "Ваш заказ готов! 🌯")
-    await sp.send_message(phone, text)
-    await cb.answer("🔔 Клиент уведомлён!")
+    await wz.send_message(phone, text)
+
+    # Убираем кнопку "Заказ готов" (чтобы не нажимать второй раз)
+    kb = cb.message.reply_markup
+    if kb:
+        new_keyboard = []
+        for row in kb.inline_keyboard:
+            # Оставляем только те кнопки, которые НЕ начинаются на ready_
+            new_row = [btn for btn in row if not (btn.callback_data and str(btn.callback_data).startswith("ready_"))]
+            if new_row:
+                new_keyboard.append(new_row)
+        try:
+            from aiogram.types import InlineKeyboardMarkup
+            await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=new_keyboard))
+        except Exception as e:
+            logger.error(f"Failed to remove ready button: {e}")
+
+    await cb.answer("🔔 Клиент уведомлён, кнопка скрыта!")
 
 
 @router.callback_query(F.data.startswith("reject_"))
@@ -405,8 +421,7 @@ async def reject_order(cb: CallbackQuery):
 
     # Снять паузу с клиента
     db.set_user_paused(phone, False)
-    await sp.set_automation(phone, True)
-    await sp.send_message(phone, "К сожалению, ваш заказ не удалось принять. Попробуйте оформить заново 🙂")
+    await wz.send_message(phone, "К сожалению, ваш заказ не удалось принять. Попробуйте оформить заново 🙂")
 
     original_text = get_ord_text(cb.message)
     for tag in [
@@ -441,7 +456,7 @@ async def reply_bridge(msg: Message, bot: Bot):
 
     # Если ТЕКСТ
     if msg.text:
-        await sp.send_message(phone, msg.text)
+        await wz.send_message(phone, msg.text)
         await msg.answer("✅ Текст отправлен в WhatsApp")
     
     # Если ФОТО
@@ -449,7 +464,7 @@ async def reply_bridge(msg: Message, bot: Bot):
         photo = msg.photo[-1]
         file_info = await bot.get_file(photo.file_id)
         file_url = f"https://api.telegram.org/file/bot{CASHIER_BOT_TOKEN}/{file_info.file_path}"
-        await sp.send_image(phone, file_url, caption="Фото вашего заказа! 🌯")
+        await wz.send_image(phone, file_url, caption="Фото вашего заказа! 🌯")
         await msg.answer("✅ Фото отправлено в WhatsApp")
 
 
@@ -464,8 +479,14 @@ async def complete_order(cb: CallbackQuery):
     db.update_order_status(order_id, "completed")
     if phone:
         db.set_user_paused(phone, False)
-        await sp.set_automation(phone, True)
-        await sp.send_message(phone, "Спасибо за заказ! Приходите ещё 🌯😊")
+        
+        # Сообщение с просьбой об отзыве 2ГИС
+        success_msg = (
+            "Спасибо за заказ! Приходите к нам еще! 🌯\n\n"
+            "Нам очень важно ваше мнение. Пожалуйста, оставьте отзыв о нас в 2ГИС, "
+            "это поможет нам стать лучше: https://2gis.kz/aktobe/firm/70000001101359951 ⭐"
+        )
+        await wz.send_message(phone, success_msg)
 
     original_text = get_ord_text(cb.message)
     for tag in [

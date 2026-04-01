@@ -5,17 +5,17 @@
 ## Стек
 - **FastAPI** — WhatsApp webhook-сервер
 - **DeepSeek v3** (через OpenRouter) — AI-агент
-- **SendPulse** — отправка сообщений в WhatsApp
+- **Wazzup** — отправка/приём сообщений WhatsApp (API v3)
 - **Supabase** — PostgreSQL база данных
-- **aiogram 3** — два Telegram-бота (кассир + курьеры)
+- **aiogram 3** — Telegram-бот кассира
 
 ## Структура
 
 ```
-doner_na_abaya/
-├── src/           # FastAPI + AI-агент
+doner_abaya_wazzup/
+├── src/           # FastAPI + AI-агент + Wazzup API
 ├── cashier_bot/   # Telegram-бот кассира
-├── courier_bot/   # Telegram-бот курьеров
+├── scripts/       # Утилиты (регистрация вебхука и пр.)
 ├── db/            # SQL-схема Supabase
 └── tests/         # Автотесты
 ```
@@ -24,7 +24,7 @@ doner_na_abaya/
 
 ### 1. Установка
 ```bash
-cd doner_na_abaya
+cd doner_abaya_wazzup
 python -m venv venv
 venv\Scripts\activate        # Windows
 pip install -r requirements.txt
@@ -33,7 +33,7 @@ pip install -r requirements.txt
 ### 2. Настройка
 ```bash
 copy .env.example .env
-# Заполните .env своими ключами
+# Заполните .env своими ключами (Wazzup API Key, Channel ID и т.д.)
 ```
 
 ### 3. База данных
@@ -51,18 +51,25 @@ uvicorn src.main:app --reload --port 8000
 python cashier_bot/main.py
 ```
 
-**Терминал 3 — Бот курьеров:**
-```bash
-python courier_bot/main.py
-```
-
-**Терминал 4 — Туннель (webhook):**
+**Терминал 3 — Туннель (webhook):**
 ```bash
 cloudflared tunnel --url http://localhost:8000
 ```
-Скопируйте URL и вставьте в SendPulse → Webhook.
 
-### 5. Тесты
+### 5. Регистрация вебхука Wazzup
+После запуска туннеля скопируйте URL и зарегистрируйте:
+```bash
+python scripts/register_webhook.py https://YOUR-TUNNEL.trycloudflare.com
+```
+
+Или через API (сервер должен быть запущен):
+```bash
+curl -X POST http://localhost:8000/internal/register-webhook \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://YOUR-TUNNEL.trycloudflare.com/webhook"}'
+```
+
+### 6. Тесты
 ```bash
 pytest tests/ -v
 ```
@@ -74,12 +81,15 @@ pytest tests/ -v
 | 🤖 AI-диалог | DeepSeek ведёт разговор, понимает рус/каз |
 | 📋 Стоп-лист | Кассир переключает наличие позиций прямо в Telegram |
 | 💳 Kaspi-чек | Валидация PDF (сумма, дата, получатель) |
-| 🛵 Курьеры | Умная маршрутизация — только свободным |
 | 💬 Мост ответов | Кассир отвечает в TG → клиент получает в WA |
 | 📊 Аналитика | View в Supabase с выручкой по дням |
 
-## Добавить курьера
-```sql
-INSERT INTO couriers (tg_id, name, status)
-VALUES (123456789, 'Имя Курьера', 'offline');
-```
+## API Endpoints
+
+| Метод | URL | Описание |
+|---|---|---|
+| GET | `/health` | Проверка состояния |
+| POST | `/webhook` | Вебхук Wazzup (входящие сообщения) |
+| POST | `/internal/resume/{phone}` | Снять паузу с клиента |
+| POST | `/internal/register-webhook` | Зарегистрировать URL вебхука |
+| GET | `/internal/webhook-info` | Текущий зарегистрированный вебхук |

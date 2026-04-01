@@ -1,12 +1,9 @@
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
-venv/
 .env
-.pytest_cache/
-*.sqlite3
-
-# OS
-.DS_Store
-Thumbs.db
+venv/
+env/
+*.log
+msg_map.json
+test_order.py

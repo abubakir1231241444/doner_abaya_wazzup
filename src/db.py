@@ -136,4 +136,27 @@ def reset_history(phone: str):
     get_db().table("conversations").delete().eq("phone", phone).execute()
 
 
+# ── WAZZUP MESSAGES (для цитирования) ─────────────────────
 
+def save_wazzup_message(message_id: str, chat_id: str, text: str, is_outgoing: bool = True):
+    """Сохранить сообщение для резолва цитат (quoted messages)."""
+    try:
+        get_db().table("wazzup_messages").upsert({
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "text": text,
+            "is_outgoing": is_outgoing,
+        }).execute()
+    except Exception as e:
+        logger.warning(f"save_wazzup_message error: {e}")
+
+
+def get_message_text(message_id: str) -> str | None:
+    """Найти текст сообщения по его Wazzup messageId."""
+    try:
+        res = get_db().table("wazzup_messages").select("text").eq("message_id", message_id).execute()
+        if res.data:
+            return res.data[0].get("text")
+    except Exception as e:
+        logger.warning(f"get_message_text error: {e}")
+    return None
