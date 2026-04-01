@@ -208,8 +208,8 @@ def is_working_hours() -> bool:
     # С 10:00 до 23:59
     if 10 <= h <= 23:
         return True
-    # С 00:00 до 00:59 (то есть до 01:00)
-    if 0 <= h < 1:
+    # С 00:00 до 01:59 (то есть до 02:00)
+    if 0 <= h < 2:
         return True
     return False
 
@@ -282,7 +282,7 @@ async def process_message(phone: str, text: str, file_url: str | None, message_i
 
     # 1. Проверка рабочих часов
     if not is_working_hours():
-        await wz.send_message(phone, "Мы сейчас закрыты 🙁 Работаем с 10:00 до 01:00 ночи. Ждём вас в рабочее время! 🌯")
+        await wz.send_message(phone, "Мы сейчас закрыты 🙁 Работаем с 10:00 до 02:00 ночи. Ждём вас в рабочее время! 🌯")
         return
 
     # 2. Клиент уже оформил заказ (пауза) — пересылаем дополнение кассиру
@@ -438,6 +438,18 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
         # Игнорируем ВСЕ не-client сообщения (manager, bot, system и т.д.)
         if author_type != "client":
             logger.info(f"Ignoring non-client message (authorType={author_type}) for {phone}")
+            
+            # Если это кассир ответил напрямую с WhatsApp / Wazzup Web
+            if author_type in ("user", "manager"):
+                if not db.is_user_paused(phone):
+                    db.set_user_paused(phone, True)
+                    from src.order_tools import _send_telegram
+                    msg = f"⚠️ Вы ответили клиенту +{phone} напрямую в WhatsApp.\nБот перешёл в режим ⏸ ПАУЗЫ, чтобы не мешать вам общаться с клиентом."
+                    try:
+                        bg_tasks.add_task(_send_telegram, msg)
+                    except Exception as e:
+                        logger.error(f"Error sending pause alert to TG: {e}")
+
             if message_id and text:
                 db.save_wazzup_message(message_id, phone, text, True)
             continue
