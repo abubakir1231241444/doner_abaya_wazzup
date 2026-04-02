@@ -97,6 +97,18 @@ _debounce_tasks: dict[str, asyncio.Task] = {}
 _followup_tasks: dict[str, asyncio.Task] = {}
 _followed_up_users: set[str] = set()
 
+# Кулдаун пропущенных звонков и системных сообщений: phone → timestamp
+_missing_call_cooldown: dict[str, float] = {}
+_system_msg_cooldown: dict[str, float] = {}
+MISSING_CALL_COOLDOWN = 30 * 60  # 30 минут
+SYSTEM_MSG_COOLDOWN = 30 * 60    # 30 минут
+
+# Лок для предотвращения двойных ответов
+_ai_processing_locks: dict[str, bool] = {}
+
+# Допустимые типы сообщений, все остальные (sticker, image, video, geo...) — игнорируем
+ALLOWED_MSG_TYPES = {"text", "audio", "document", "missing_call"}
+
 FOLLOWUP_DELAY = 5 * 60   # секунды
 DEBOUNCE_TIME  = 10.0     # секунды
 
@@ -118,6 +130,10 @@ async def memory_cleanup_loop():
             ts, _ = _pending_receipts[k]
             if now - ts > 3600:
                 del _pending_receipts[k]
+        for k in list(_pending_payment.keys()):
+            ts = _pending_payment[k].get("timestamp", 0)
+            if now - ts > 3600:
+                del _pending_payment[k]
         logger.info("Memory cleanup performed.")
 
 
@@ -138,9 +154,21 @@ async def _debounced_worker(phone: str):
         if not texts:
             return
 
+        # Если уже обрабатываем сообщения от этого номера — ждём
+        if _ai_processing_locks.get(phone):
+            logger.info(f"AI already processing for {phone}, skipping debounce loop run.")
+            # Вернём тексты обратно в буфер спереди
+            _debounce_buffer.setdefault(phone, []).extend(texts)
+            return
+
+        _ai_processing_locks[phone] = True
+
         combined_text = "\n".join(texts)
         logger.info(f"Debounced: {len(texts)} сообщений от {phone}: {combined_text[:100]}")
-        await process_message(phone, combined_text, None, None)
+        try:
+            await process_message(phone, combined_text, None, None)
+        finally:
+            _ai_processing_locks.pop(phone, None)
     except asyncio.CancelledError:
         pass
 
@@ -249,7 +277,7 @@ def is_working_hours() -> bool:
 
 # ── РАЗБОР ВЕБХУКА WAZZUP ─────────────────────────────────
 
-def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str, str, str]:
+def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str, str, str, bool]:
     """
     Разбирает один объект сообщения из массива messages вебхука Wazzup v3.
 
@@ -264,32 +292,40 @@ def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str, 
           "type": "text" | "image" | "document" | "audio" | "video" | ...,
           "text": "...",          — только если type == text
           "contentUri": "...",    — URL файла (PDF-чек, фото и т.д.)
-          "dateTime": 1234567890000,
-          "authorType": "client" | "manager" | "bot"
+          "isEcho": true/false,   — true = отправлено через API (нашим ботом)
+          "status": "inbound" | "sent" | "delivered" | "read" | "error",
+          "dateTime": 1234567890000
         }
       ]
     }
 
-    Возвращает: (phone, text, file_url, message_id, author_type, msg_type, status)
+    Возвращает: (phone, text, file_url, message_id, author_type, msg_type, status, is_echo)
     """
     try:
         phone       = str(data.get("chatId", "")).lstrip("+")
         message_id  = data.get("messageId", "")
         text        = data.get("text", "") or ""
         content_uri = data.get("contentUri") or None
-        author_type = data.get("authorType")  
         msg_type    = data.get("type", "text")
         status      = data.get("status", "inbound")
+        is_echo       = data.get("isEcho", False)   # true = исходящее сообщение
+        sent_from_app = data.get("sentFromApp", False)  # true = написано из Wazzup Phone/Web (кассир)
         
-        # Любое сообщение со статусом не 'inbound' — это исходящее сообщение (от нас или от менеджера)
-        if status != "inbound":
-            author_type = "manager"
-        elif not author_type:
+        # Определяем автора:
+        # - status == "inbound" и isEcho == False → клиент пишет
+        # - isEcho == True и sentFromApp == True → кассир написал из Wazzup Phone/Web → ставим паузу
+        # - isEcho == True и sentFromApp == False → наш бот отправил через API → игнорируем
+        # - status != "inbound" и isEcho == False → статус-обновление (delivered/read) → игнорируем
+        if status == "inbound" and not is_echo:
             author_type = "client"
+        elif is_echo and sent_from_app:
+            author_type = "manager"  # кассир пишет из Wazzup Phone → ставим паузу
+        else:
+            author_type = "bot"  # наш бот через API или статус-обновление → игнорируем
 
-        # Для файлов без текста — file_url
+        # Для файлов — file_url
         file_url = None
-        if msg_type in ("document", "image", "audio", "video", "file") and content_uri:
+        if msg_type in ("document", "audio") and content_uri:
             file_url = content_uri
 
         # Если есть quoted (ответ на сообщение) — ищем исходный текст в БД
@@ -297,22 +333,26 @@ def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str, 
         if isinstance(quoted_msg, dict):
             quoted_id = quoted_msg.get("messageId")
             if quoted_id:
-                original_text = db.get_message_text(quoted_id)
+                original_text, quoted_is_outgoing = db.get_message_info(quoted_id)
                 if original_text:
-                    text = f'[Клиент ответил на наше сообщение: "{original_text}"]\n{text}'
+                    if quoted_is_outgoing:
+                        text = f'[Клиент ответил на наше сообщение: "{original_text}"]\n{text}'
+                    else:
+                        text = f'[Клиент ответил на своё предыдущее сообщение: "{original_text}"]\n{text}'
                 else:
-                    text = f'[Клиент ответил на наше предыдущее сообщение]\n{text}'
+                    text = f'[Клиент ответил на предыдущее сообщение]\n{text}'
 
         logger.info(
             f"Wazzup msg: phone={phone}, type={msg_type}, "
-            f"author={author_type}, text='{text[:80]}', "
+            f"author={author_type}, isEcho={is_echo}, status={status}, "
+            f"text='{text[:80]}', "
             f"file_url={'yes' if file_url else 'no'}, id={message_id}"
         )
-        return phone, text.strip(), file_url, message_id, author_type, msg_type, status
+        return phone, text.strip(), file_url, message_id, author_type, msg_type, status, is_echo
 
     except Exception as e:
         logger.error(f"extract_message error: {e} | data={data}")
-        return "", "", None, None, "client", "text", "inbound"
+        return "", "", None, None, "client", "text", "inbound", False
 
 
 # ── ОСНОВНАЯ ЛОГИКА ОБРАБОТКИ ─────────────────────────────
@@ -320,18 +360,29 @@ def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str, 
 async def process_message(phone: str, text: str, file_url: str | None, message_id: str | None, msg_type: str = "text"):
     """Основная логика обработки входящего сообщения от клиента."""
 
+    now = time.time()
+
     # 1. Проверка состояния бота
     if is_bot_disabled():
-        await wz.send_message(phone, "🙏 Извините за неудобства, у нас временные технические неполадки. Скоро всё исправим и вернемся к работе. Спасибо за понимание 🤍")
+        last_sys = _system_msg_cooldown.get(phone, 0)
+        if now - last_sys > SYSTEM_MSG_COOLDOWN:
+            await wz.send_message(phone, "🙏 Извините за неудобства, у нас временные технические неполадки. Скоро всё исправим и вернемся к работе. Спасибо за понимание 🤍")
+            _system_msg_cooldown[phone] = now
         return
 
     if is_juma_time():
-        await wz.send_message(phone, "🙏 Извините за неудобства, сейчас перерыв в честь Жума-намаза. Спасибо за понимание 🤍")
+        last_sys = _system_msg_cooldown.get(phone, 0)
+        if now - last_sys > SYSTEM_MSG_COOLDOWN:
+            await wz.send_message(phone, "🙏 Извините за неудобства, сейчас перерыв в честь Жума-намаза. Спасибо за понимание 🤍")
+            _system_msg_cooldown[phone] = now
         return
 
     # 1.2 Проверка рабочих часов
     if not is_working_hours():
-        await wz.send_message(phone, "Мы сейчас закрыты 🙁 Работаем с 10:00 до 02:00 ночи. Ждём вас в рабочее время! 🌯")
+        last_sys = _system_msg_cooldown.get(phone, 0)
+        if now - last_sys > SYSTEM_MSG_COOLDOWN:
+            await wz.send_message(phone, "Мы сейчас закрыты 🙁 Работаем с 10:00 до 02:00 ночи. Ждём вас в рабочее время! 🌯")
+            _system_msg_cooldown[phone] = now
         return
 
     # 2. Клиент уже оформил заказ (пауза) — пересылаем дополнение кассиру
@@ -354,9 +405,8 @@ async def process_message(phone: str, text: str, file_url: str | None, message_i
             if not transcription:
                 await wz.send_message(phone, "Извините, не смог разобрать голосовое сообщение 🙁 Напишите текстом, пожалуйста.")
                 return
-            # Меняем text на транскрипцию и идём дальше к AI
+            # Меняем text на транскрипцию и идём дальше к AI (молча, без echo)
             text = transcription
-            await wz.send_message(phone, f"🎤 _{text}_")
             file_url = None  # Сбрасываем URL, это не чек
         else:
             # Чек об оплате (PDF или фото)
@@ -423,6 +473,7 @@ async def process_message(phone: str, text: str, file_url: str | None, message_i
                 _pending_payment[phone] = {
                     "order_total": args["summa"],
                     "order_args":  args,
+                    "timestamp": time.time(),
                 }
                 from src.config import KASPI_PAY_URL
                 await wz.send_message(
@@ -482,15 +533,24 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
     logger.info(f"Wazzup webhook: {len(messages)} message(s) received")
 
     for msg in messages:
-        phone, text, file_url, message_id, author_type, msg_type, status = extract_message(msg)
+        phone, text, file_url, message_id, author_type, msg_type, status, is_echo = extract_message(msg)
 
         # 0. Игнорируем заблокированные номера (например, админ) — самый первый фильтр
         if phone in BLOCKED_PHONES:
             logger.info(f"Phone {phone} is in BLOCKED_PHONES, ignoring.")
             continue
 
-        # 1. Пропущенный звонок — отвечаем клиенту, что нужно писать
+        # 1. Пропущенный звонок — отвечаем клиенту, что нужно писать (с кулдауном 30 мин)
         if msg_type == "missing_call":
+            if db.is_user_paused(phone):
+                logger.info(f"Missing call from paused phone {phone} — ignoring")
+                continue
+            now = time.time()
+            last_call_reply = _missing_call_cooldown.get(phone, 0)
+            if now - last_call_reply < MISSING_CALL_COOLDOWN:
+                logger.info(f"Missing call from {phone} — cooldown active, ignoring")
+                continue
+            _missing_call_cooldown[phone] = now
             logger.info(f"Missing call from {phone} — sending write-us reply")
             bg_tasks.add_task(
                 wz.send_message,
@@ -500,41 +560,58 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
             )
             continue
 
-        # 2. Исходящие сообщения (наши собственные) — просто игнорируем
-        #    Wazzup возвращает вебхук для КАЖДОГО отправленного нами сообщения
-        #    с status != "inbound". Это НЕ кассир пишет, это эхо бота.
-        if status != "inbound":
-            logger.info(f"Ignoring outbound echo (status={status}) for {phone}")
+        # 2. Исходящие от бота (isEcho=true) — просто игнорируем
+        if author_type == "bot":
+            logger.info(f"Ignoring bot echo (isEcho=true, status={status}) for {phone}")
             if message_id and text:
                 db.save_wazzup_message(message_id, phone, text, True)
             continue
 
-        # 3. Эхо-детекция (хеш текста + кулдаун после отправки)
+        # 3. Исходящие от кассира (status != inbound, isEcho=false) — ставим паузу
+        if author_type == "manager":
+            logger.info(f"Manager/cashier wrote to {phone} (status={status}, isEcho={is_echo})")
+            if not db.is_user_paused(phone):
+                db.set_user_paused(phone, True)
+                _cancel_followup(phone)  # Отменяем напоминание от бота
+                from src.order_tools import _send_telegram
+                pause_msg = f"⚠️ Вы ответили клиенту +{phone} напрямую в WhatsApp.\nБот перешёл в режим ⏸ ПАУЗЫ, чтобы не мешать вам общаться с клиентом."
+                try:
+                    bg_tasks.add_task(_send_telegram, pause_msg)
+                except Exception as e:
+                    logger.error(f"Error sending pause alert to TG: {e}")
+            if message_id and text:
+                db.save_wazzup_message(message_id, phone, text, True)
+            continue
+
+        # 4. Эхо-детекция (хеш текста + кулдаун после отправки)
         if text and wz.is_echo(phone, text):
             logger.info(f"Ignoring echo from {phone}")
             if message_id:
                 db.save_wazzup_message(message_id, phone, text, True)
             continue
 
-        # 4. Не-client сообщения (когда кассир РЕАЛЬНО пишет вручную в Wazzup Web)
-        #    Такие сообщения приходят с status=inbound и authorType=user/manager
-        if author_type != "client":
-            logger.info(f"Non-client message (authorType={author_type}) for {phone}")
-            
-            # Кассир ответил напрямую — ставим бота на паузу
-            if author_type in ("user", "manager"):
-                if not db.is_user_paused(phone):
-                    db.set_user_paused(phone, True)
-                    from src.order_tools import _send_telegram
-                    msg = f"⚠️ Вы ответили клиенту +{phone} напрямую в WhatsApp.\nБот перешёл в режим ⏸ ПАУЗЫ, чтобы не мешать вам общаться с клиентом."
-                    try:
-                        bg_tasks.add_task(_send_telegram, msg)
-                    except Exception as e:
-                        logger.error(f"Error sending pause alert to TG: {e}")
-
-            if message_id and text:
-                db.save_wazzup_message(message_id, phone, text, True)
+        # 5. Фильтр типов сообщений — принимаем только text, audio, document
+        #    Стикеры, видео, геолокации и т.д. — игнорируем молча
+        #    Изображения — просим отправить PDF
+        if msg_type not in ALLOWED_MSG_TYPES:
+            if msg_type == "image":
+                logger.info(f"Image received from {phone} — asking for PDF")
+                bg_tasks.add_task(
+                    wz.send_message,
+                    phone,
+                    "Мы принимаем чек только в формате PDF 📄 Пожалуйста, отправьте PDF-файл чека из Kaspi."
+                )
+            else:
+                logger.info(f"Ignoring unsupported msg_type={msg_type} from {phone}")
             continue
+
+        # 6. Для документов — принимаем только PDF (проверка по URL)
+        if msg_type == "document" and file_url:
+            url_lower = file_url.lower()
+            if not (".pdf" in url_lower):
+                logger.info(f"Ignoring non-PDF document from {phone}: {file_url[:100]}")
+                await wz.send_message(phone, "Мы принимаем чек только в формате PDF 📄 Пожалуйста, отправьте PDF-файл чека.")
+                continue
 
         # Дедубликация по message_id
         if message_id and message_id in _recent_messages:
@@ -542,6 +619,9 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
             continue
         if message_id:
             _recent_messages[message_id] = time.time()
+            # Сохраняем ВХОДЯЩЕЕ сообщение в wazzup_messages для резолва цитат (quoted messages)
+            if text:
+                db.save_wazzup_message(message_id, phone, text, is_outgoing=False)
 
         if not phone:
             logger.warning("No phone extracted from webhook message")

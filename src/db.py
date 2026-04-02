@@ -151,12 +151,12 @@ def save_wazzup_message(message_id: str, chat_id: str, text: str, is_outgoing: b
         logger.warning(f"save_wazzup_message error: {e}")
 
 
-def get_message_text(message_id: str) -> str | None:
-    """Найти текст сообщения по его Wazzup messageId."""
+def get_message_info(message_id: str) -> tuple[str | None, bool]:
+    """Найти текст сообщения и флаг is_outgoing по его Wazzup messageId."""
     try:
-        res = get_db().table("wazzup_messages").select("text").eq("message_id", message_id).execute()
+        res = get_db().table("wazzup_messages").select("text, is_outgoing").eq("message_id", message_id).execute()
         if res.data:
-            return res.data[0].get("text")
+            return res.data[0].get("text"), res.data[0].get("is_outgoing", False)
     except Exception as e:
-        logger.warning(f"get_message_text error: {e}")
-    return None
+        logger.warning(f"get_message_info error: {e}")
+    return None, False

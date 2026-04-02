@@ -118,9 +118,8 @@ async def handle_create_order(phone: str, args: dict, receipt_bytes: bytes = Non
         qty   = p.get("qty", 1)
         price = p.get("price", 0)
         size  = p.get("size", "")
-        onion = "с луком" if p.get("onion", True) else "без лука"
         wish_i = p.get("wish", "") or ""
-        details = f"{size}; {onion}" + (f"; {wish_i}" if wish_i and wish_i != "нет" else "")
+        details = size + (f"; {wish_i}" if wish_i and wish_i != "нет" else "")
         items_text += f"  • {name} ×{qty} ({details}) — {price * qty} тг\n"
 
     dt_label = DELIVERY_LABELS.get(dtype, dtype)
