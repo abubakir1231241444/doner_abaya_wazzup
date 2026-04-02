@@ -35,5 +35,6 @@ TZ               = os.getenv("TZ", "Asia/Oral")
 WORK_HOUR_OPEN   = int(os.getenv("WORK_HOUR_OPEN", "10"))
 WORK_HOUR_CLOSE  = int(os.getenv("WORK_HOUR_CLOSE", "1"))   # 01:00
 DELIVERY_COST    = int(os.getenv("DELIVERY_COST", "500"))
-ALLOWED_PHONES   = os.getenv("ALLOWED_PHONES", "77472337906").split(",")
+ALLOWED_PHONES   = [p.strip() for p in os.getenv("ALLOWED_PHONES", "").split(",") if p.strip()]
+BLOCKED_PHONES   = {p.strip() for p in os.getenv("BLOCKED_PHONES", "77081840424").split(",") if p.strip()}
 PDF_MAX_AGE_MIN  = 15  # максимальный возраст чека в минутах

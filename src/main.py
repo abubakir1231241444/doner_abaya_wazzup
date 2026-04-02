@@ -29,7 +29,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
 
-from src.config import TZ, WORK_HOUR_OPEN, WORK_HOUR_CLOSE, WEBHOOK_SECRET, ALLOWED_PHONES
+from src.config import TZ, WORK_HOUR_OPEN, WORK_HOUR_CLOSE, WEBHOOK_SECRET, ALLOWED_PHONES, BLOCKED_PHONES
 from src import db
 from src import wazzup as wz
 from src.ai_agent import get_agent_response
@@ -216,7 +216,7 @@ def is_working_hours() -> bool:
 
 # ── РАЗБОР ВЕБХУКА WAZZUP ─────────────────────────────────
 
-def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str]:
+def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str, str, str]:
     """
     Разбирает один объект сообщения из массива messages вебхука Wazzup v3.
 
@@ -237,15 +237,22 @@ def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str]:
       ]
     }
 
-    Возвращает: (phone, text, file_url, message_id, author_type, msg_type)
+    Возвращает: (phone, text, file_url, message_id, author_type, msg_type, status)
     """
     try:
         phone       = str(data.get("chatId", "")).lstrip("+")
         message_id  = data.get("messageId", "")
         text        = data.get("text", "") or ""
         content_uri = data.get("contentUri") or None
-        author_type = data.get("authorType", "client")
+        author_type = data.get("authorType")  
         msg_type    = data.get("type", "text")
+        status      = data.get("status", "inbound")
+        
+        # Любое сообщение со статусом не 'inbound' — это исходящее сообщение (от нас или от менеджера)
+        if status != "inbound":
+            author_type = "manager"
+        elif not author_type:
+            author_type = "client"
 
         # Для файлов без текста — file_url
         file_url = None
@@ -268,11 +275,11 @@ def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str]:
             f"author={author_type}, text='{text[:80]}', "
             f"file_url={'yes' if file_url else 'no'}, id={message_id}"
         )
-        return phone, text.strip(), file_url, message_id, author_type, msg_type
+        return phone, text.strip(), file_url, message_id, author_type, msg_type, status
 
     except Exception as e:
         logger.error(f"extract_message error: {e} | data={data}")
-        return "", "", None, None, "client", "text"
+        return "", "", None, None, "client", "text", "inbound"
 
 
 # ── ОСНОВНАЯ ЛОГИКА ОБРАБОТКИ ─────────────────────────────
@@ -433,9 +440,25 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
     logger.info(f"Wazzup webhook: {len(messages)} message(s) received")
 
     for msg in messages:
-        phone, text, file_url, message_id, author_type, msg_type = extract_message(msg)
+        phone, text, file_url, message_id, author_type, msg_type, status = extract_message(msg)
 
-        # Игнорируем ВСЕ не-client сообщения (manager, bot, system и т.д.)
+        # 0. Игнорируем заблокированные номера (например, админ) — самый первый фильтр
+        if phone in BLOCKED_PHONES:
+            logger.info(f"Phone {phone} is in BLOCKED_PHONES, ignoring.")
+            continue
+
+        # 1. Пропущенный звонок — отвечаем клиенту, что нужно писать
+        if msg_type == "missing_call":
+            logger.info(f"Missing call from {phone} — sending write-us reply")
+            bg_tasks.add_task(
+                wz.send_message,
+                phone,
+                "Здравствуйте! К сожалению, мы не принимаем звонки по WhatsApp 📵\n"
+                "Напишите ваш заказ сюда — и мы его быстро оформим! 🌯"
+            )
+            continue
+
+        # 2. Игнорируем ВСЕ не-client сообщения (manager, bot, system и т.д.)
         if author_type != "client":
             logger.info(f"Ignoring non-client message (authorType={author_type}) for {phone}")
             
