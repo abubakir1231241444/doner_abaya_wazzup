@@ -6,7 +6,7 @@ Function Calling: create_order, escalate_to_admin.
 import json
 import logging
 from openai import AsyncOpenAI
-from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL, KASPI_PAY_URL, DELIVERY_COST
+from src.config import OPENROUTER_API_KEY, OPENROUTER_MODEL, KASPI_PAY_URL
 from src.menu_builder import build_menu_markdown
 from src import db
 
@@ -51,15 +51,17 @@ SYSTEM_PROMPT_TEMPLATE = """<role>
 Часы работы: с 10:00 до 02:00 ночи
 Халяль: да, 100% халяль 🙂
 Оплата: только Kaspi — {kaspi_url}
+После оплаты принимаем ТОЛЬКО PDF-файл чека Kaspi. Фото/скриншоты и другие форматы не принимаются.
 Соусы и перчик: входят в стоимость донера. Докупить: Красный соус — 150 тг, Белый соус — бесплатно, Перчик — 150 тг
 Время готовности: 10–15 минут
-Доставка: своей доставки нет. Можно забрать самому или вызвать Яндекс/InDriver на 12 мкр 17Б — передадим курьеру 🙂
+Доставка: своей доставки нет. Можно забрать самому, в кафе или вызвать своего курьера (Яндекс/InDriver) — передадим заказ курьеру 🙂
 </faq>
 
 <delivery_types>
 С собой — самовывоз.
 В кафе — на месте.
-Курьер клиента — клиент вызывает Яндекс/InDriver на 12 мкр 17Б, мы передаём курьеру.
+Курьер клиента — клиент вызывает Яндекс/InDriver на 12 мкр 17Б, мы передаём заказ курьеру.
+Своей доставки у нас нет.
 </delivery_types>
 
 <menu>
@@ -92,7 +94,7 @@ SYSTEM_PROMPT_TEMPLATE = """<role>
 
 ШАГ 5 — После ДА:
 «Оплата через Kaspi: {kaspi_url}
-После оплаты пришлите скриншот чека 🙂»
+После оплаты пришлите PDF-файл чека Kaspi. Другие форматы не принимаем 🙂»
 
 ШАГ 6 — Получен чек → СРАЗУ вызывай create_order.
 </order_flow>

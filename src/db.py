@@ -53,8 +53,15 @@ def set_item_availability(item_id: int, available: bool):
 
 # ── ORDERS ────────────────────────────────────────────────
 
-def create_order(user_id: int, items: list, total: int, delivery_type: str,
-                 food_wish: str = "нет", address: str = None, phone: str = None) -> dict:
+def create_order(
+    user_id: int,
+    items: list,
+    total: int,
+    delivery_type: str,
+    food_wish: str = "нет",
+    address: str | None = None,
+    phone: str | None = None,
+) -> dict:
     from datetime import datetime, timezone
     import pytz
     from src.config import TZ

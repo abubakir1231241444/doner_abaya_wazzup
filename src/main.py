@@ -34,8 +34,9 @@ from src.config import TZ, WORK_HOUR_OPEN, WORK_HOUR_CLOSE, WEBHOOK_SECRET, ALLO
 from src import db
 from src import wazzup as wz
 from src.ai_agent import get_agent_response
-from src.pdf_validator import validate_receipt
 from src.order_tools import handle_create_order, handle_escalate
+
+ORDER_HANDLER_FAILED = object()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -96,6 +97,9 @@ _debounce_tasks: dict[str, asyncio.Task] = {}
 # Follow-up таймеры (второе касание через 5 мин)
 _followup_tasks: dict[str, asyncio.Task] = {}
 _followed_up_users: set[str] = set()
+_cashier_hold_until: dict[str, float] = {}
+_cashier_touch_at: dict[str, float] = {}
+_last_client_activity: dict[str, float] = {}
 
 # Кулдаун пропущенных звонков и системных сообщений: phone → timestamp
 _missing_call_cooldown: dict[str, float] = {}
@@ -109,8 +113,15 @@ _ai_processing_locks: dict[str, bool] = {}
 # Допустимые типы сообщений, все остальные (sticker, image, video, geo...) — игнорируем
 ALLOWED_MSG_TYPES = {"text", "audio", "document", "missing_call"}
 
+IMAGE_PLACEHOLDER_MARKERS = (
+    "[image",
+    "cannot read \"clipboard\"",
+    "does not support image input",
+)
+
 FOLLOWUP_DELAY = 5 * 60   # секунды
 DEBOUNCE_TIME  = 10.0     # секунды
+HISTORY_LIMIT = 120
 
 
 # ── ОЧИСТКА ПАМЯТИ ────────────────────────────────────────
@@ -134,6 +145,15 @@ async def memory_cleanup_loop():
             ts = _pending_payment[k].get("timestamp", 0)
             if now - ts > 3600:
                 del _pending_payment[k]
+        for k in list(_cashier_hold_until.keys()):
+            if now >= _cashier_hold_until[k]:
+                del _cashier_hold_until[k]
+        for k in list(_cashier_touch_at.keys()):
+            if now - _cashier_touch_at[k] > 24 * 3600:
+                del _cashier_touch_at[k]
+        for k in list(_last_client_activity.keys()):
+            if now - _last_client_activity[k] > 24 * 3600:
+                del _last_client_activity[k]
         logger.info("Memory cleanup performed.")
 
 
@@ -162,6 +182,7 @@ async def _debounced_worker(phone: str):
             return
 
         _ai_processing_locks[phone] = True
+        register_client_activity(phone)
 
         combined_text = "\n".join(texts)
         logger.info(f"Debounced: {len(texts)} сообщений от {phone}: {combined_text[:100]}")
@@ -182,6 +203,10 @@ async def _followup_worker(phone: str):
         await asyncio.sleep(FOLLOWUP_DELAY)
 
         if db.is_user_paused(phone) or phone in _followed_up_users:
+            return
+
+        if not _needs_followup_by_history(phone):
+            logger.info(f"Follow-up skipped for {phone}: no follow-up needed by history")
             return
 
         history = db.get_history(phone)
@@ -226,7 +251,7 @@ async def _followup_worker(phone: str):
             max_tokens=100,
         )
 
-        followup_text = resp.choices[0].message.content.strip()
+        followup_text = (resp.choices[0].message.content or "").strip()
         if followup_text:
             _followed_up_users.add(phone)
             await wz.send_message(phone, followup_text)
@@ -259,20 +284,153 @@ def _cancel_followup(phone: str):
 # ── РАБОЧИЕ ЧАСЫ ─────────────────────────────────────────
 
 def is_working_hours() -> bool:
-    """Проверить, работает ли кафе (10:00–01:00)."""
-    import pytz
-    from datetime import datetime
-    tz_local = pytz.timezone("Asia/Aqtobe")
+    """Проверить, работает ли кафе (используем WORK_HOUR_OPEN / WORK_HOUR_CLOSE)."""
     now = datetime.now(tz_local)
     h = now.hour
-    
-    # С 10:00 до 23:59
-    if 10 <= h <= 23:
+
+    if WORK_HOUR_OPEN == WORK_HOUR_CLOSE:
         return True
-    # С 00:00 до 01:59 (то есть до 02:00)
-    if 0 <= h < 2:
+    if WORK_HOUR_OPEN < WORK_HOUR_CLOSE:
+        return WORK_HOUR_OPEN <= h < WORK_HOUR_CLOSE
+    return h >= WORK_HOUR_OPEN or h < WORK_HOUR_CLOSE
+
+
+def _is_image_placeholder_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    return any(marker in t for marker in IMAGE_PLACEHOLDER_MARKERS)
+
+
+def _work_hours_text() -> str:
+    return f"{WORK_HOUR_OPEN:02d}:00 до {WORK_HOUR_CLOSE:02d}:00"
+
+
+def register_cashier_touch(phone: str):
+    now = time.time()
+    _cashier_touch_at[phone] = now
+    _cashier_hold_until[phone] = now + FOLLOWUP_DELAY
+    _cancel_followup(phone)
+
+
+def register_client_activity(phone: str):
+    _last_client_activity[phone] = time.time()
+
+
+def _recent_history_for_followup(phone: str) -> list[dict]:
+    history = db.get_history(phone)
+    if not history:
+        return []
+    return history[-HISTORY_LIMIT:]
+
+
+def _has_manager_signal_last_day(phone: str) -> bool:
+    now = time.time()
+    hold_until = _cashier_hold_until.get(phone, 0)
+    if now < hold_until:
         return True
+
+    touch_at = _cashier_touch_at.get(phone, 0)
+    if touch_at and (now - touch_at) < 24 * 3600:
+        last_client_ts = _last_client_activity.get(phone, 0)
+        if last_client_ts <= touch_at:
+            return True
+
+    history = _recent_history_for_followup(phone)
+    if not history:
+        return False
+
+    recent = history[-25:]
+    manager_markers = (
+        "передал ваше дополнение к заказу кассиру",
+        "передаю",
+        "администратор свяжется",
+        "ваш чек передан кассиру",
+        "чек передан кассиру",
+    )
+
+    for msg in reversed(recent):
+        if msg.get("role") != "assistant":
+            continue
+        content = (msg.get("content") or "").strip().lower()
+        if any(marker in content for marker in manager_markers):
+            return True
     return False
+
+
+def _needs_followup_by_history(phone: str) -> bool:
+    history = _recent_history_for_followup(phone)
+    if not history:
+        return False
+
+    if _has_manager_signal_last_day(phone):
+        return False
+
+    last_client_ts = _last_client_activity.get(phone, 0)
+    if not last_client_ts:
+        return False
+    if time.time() - last_client_ts < FOLLOWUP_DELAY:
+        return False
+
+    # Уже был системный успех/финализация заказа
+    for msg in reversed(history):
+        content = (msg.get("content") or "")
+        if "СИСТЕМА: Заказ #" in content:
+            return False
+        if msg.get("role") == "user":
+            break
+
+    # Ищем последнего пользователя и проверяем, есть ли после него ответ ассистента
+    user_idx = -1
+    for i in range(len(history) - 1, -1, -1):
+        if history[i].get("role") == "user":
+            user_idx = i
+            break
+
+    if user_idx == -1:
+        return False
+
+    user_text = (history[user_idx].get("content") or "").strip().lower()
+    if not user_text:
+        return False
+
+    # Если после последнего user уже есть assistant-ответ — follow-up не нужен
+    has_assistant_after = any(
+        m.get("role") == "assistant"
+        for m in history[user_idx + 1:]
+    )
+    if has_assistant_after:
+        return False
+
+    # Если это явное подтверждение оплаты/чека/подтверждение заказа — не пушим повторно
+    no_ping_markers = (
+        "pdf",
+        "чек",
+        "оплат",
+        "да",
+        "ок",
+        "готов",
+        "спасибо",
+    )
+    if any(marker in user_text for marker in no_ping_markers):
+        return False
+
+    return True
+
+
+async def _create_order_safe(
+    phone: str,
+    args: dict,
+    receipt_bytes: bytes | None = None,
+) -> int | object:
+    result = await handle_create_order(phone, args, receipt_bytes=receipt_bytes)
+    if isinstance(result, tuple):
+        order_id = result[0]
+    else:
+        order_id = result
+    if not order_id:
+        return ORDER_HANDLER_FAILED
+    return int(order_id)
 
 
 # ── РАЗБОР ВЕБХУКА WAZZUP ─────────────────────────────────
@@ -361,6 +519,7 @@ async def process_message(phone: str, text: str, file_url: str | None, message_i
     """Основная логика обработки входящего сообщения от клиента."""
 
     now = time.time()
+    register_client_activity(phone)
 
     # 1. Проверка состояния бота
     if is_bot_disabled():
@@ -381,7 +540,7 @@ async def process_message(phone: str, text: str, file_url: str | None, message_i
     if not is_working_hours():
         last_sys = _system_msg_cooldown.get(phone, 0)
         if now - last_sys > SYSTEM_MSG_COOLDOWN:
-            await wz.send_message(phone, "Мы сейчас закрыты 🙁 Работаем с 10:00 до 02:00 ночи. Ждём вас в рабочее время! 🌯")
+            await wz.send_message(phone, f"Мы сейчас закрыты 🙁 Работаем с {_work_hours_text()}. Ждём вас в рабочее время! 🌯")
             _system_msg_cooldown[phone] = now
         return
 
@@ -409,10 +568,12 @@ async def process_message(phone: str, text: str, file_url: str | None, message_i
             text = transcription
             file_url = None  # Сбрасываем URL, это не чек
         else:
-            # Чек об оплате (PDF или фото)
+            # Чек об оплате (только PDF)
             if phone in _pending_payment:
                 pending = _pending_payment.pop(phone)
-                order_id, _ = await handle_create_order(phone, pending["order_args"], receipt_bytes=file_bytes)
+                order_id = await _create_order_safe(phone, pending["order_args"], receipt_bytes=file_bytes)
+                if order_id is ORDER_HANDLER_FAILED:
+                    return
                 _cancel_followup(phone)
                 db.set_user_paused(phone, True)
                 history = db.get_history(phone)
@@ -435,6 +596,15 @@ async def process_message(phone: str, text: str, file_url: str | None, message_i
     if not text:
         return
 
+    # 4.1 Плейсхолдеры изображений / системные ошибки про буфер обмена
+    if _is_image_placeholder_text(text):
+        await wz.send_message(
+            phone,
+            "Я не вижу изображение в этом сообщении. Напишите запрос текстом. "
+            "Если это оплата — отправьте PDF-файл чека Kaspi 📄"
+        )
+        return
+
     # 5. Флаг наличия чека
     has_valid_receipt = "[СИСТЕМА: Клиент прислал чек" in text
 
@@ -454,13 +624,15 @@ async def process_message(phone: str, text: str, file_url: str | None, message_i
 
             if has_valid_receipt or phone in _valid_receipts_passed or pdf_bytes_to_pass:
                 # Чек есть — оформляем сразу
-                order_id, _ = await handle_create_order(phone, args, receipt_bytes=pdf_bytes_to_pass)
+                order_id = await _create_order_safe(phone, args, receipt_bytes=pdf_bytes_to_pass)
+                if order_id is ORDER_HANDLER_FAILED:
+                    return
                 _cancel_followup(phone)
                 db.set_user_paused(phone, True)
                 history = db.get_history(phone)
                 history.append({
                     "role": "user",
-                    "content": f"[СИСТЕМА: Заказ #{order_id} оформлен. Ожидайте готовности/доставки.]"
+                    "content": f"[СИСТЕМА: Заказ #{order_id} оформлен. Ожидайте готовности.]"
                 })
                 if len(history) > 40:
                     history = history[-40:]
@@ -515,6 +687,12 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
     Wazzup добавляет заголовок Authorization: Bearer {crmKey} если настроен.
     Мы используем параметр ?secret= для дополнительной безопасности.
     """
+    if WEBHOOK_SECRET:
+        secret = request.query_params.get("secret", "")
+        if secret != WEBHOOK_SECRET:
+            logger.warning("Webhook rejected: invalid secret")
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+
     try:
         data = await request.json()
     except Exception:
@@ -570,6 +748,7 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
         # 3. Исходящие от кассира (status != inbound, isEcho=false) — ставим паузу
         if author_type == "manager":
             logger.info(f"Manager/cashier wrote to {phone} (status={status}, isEcho={is_echo})")
+            register_cashier_touch(phone)
             if not db.is_user_paused(phone):
                 db.set_user_paused(phone, True)
                 _cancel_followup(phone)  # Отменяем напоминание от бота
@@ -660,6 +839,17 @@ async def resume_user(phone: str):
     return {"ok": True, "phone": phone}
 
 
+@app.post("/internal/cashier-touch/{phone}")
+async def cashier_touch(phone: str):
+    """Пометить контакт с клиентом от кассира и временно отключить follow-up."""
+    register_cashier_touch(phone)
+    return {
+        "ok": True,
+        "phone": phone,
+        "hold_until": _cashier_hold_until.get(phone, 0),
+    }
+
+
 @app.post("/internal/register-webhook")
 async def register_webhook_endpoint(request: Request):
     """
@@ -671,6 +861,9 @@ async def register_webhook_endpoint(request: Request):
         webhook_url = body.get("url", "")
         if not webhook_url:
             raise HTTPException(status_code=400, detail="url is required")
+        if WEBHOOK_SECRET and "secret=" not in webhook_url:
+            sep = "&" if "?" in webhook_url else "?"
+            webhook_url = f"{webhook_url}{sep}secret={WEBHOOK_SECRET}"
         ok = await wz.register_webhook(webhook_url)
         return {"ok": ok, "registered_url": webhook_url}
     except HTTPException:
@@ -695,4 +888,3 @@ async def set_state_endpoint(request: Request):
     global_state.update(data)
     save_state(global_state)
     return global_state
-

@@ -17,7 +17,12 @@ DELIVERY_LABELS = {
 }
 
 
-async def _send_telegram(text: str, reply_markup: dict = None, order_id: int = None, receipt_bytes: bytes = None):
+async def _send_telegram(
+    text: str,
+    reply_markup: dict | None = None,
+    order_id: int | None = None,
+    receipt_bytes: bytes | None = None,
+):
     """Отправить сообщение или документ в Telegram всем кассирам."""
     first_resp = {}
     for chat_id in CASHIER_TG_IDS:
@@ -69,10 +74,14 @@ async def _send_telegram(text: str, reply_markup: dict = None, order_id: int = N
 
 
 
-async def handle_create_order(phone: str, args: dict, receipt_bytes: bytes = None) -> int | None:
+async def handle_create_order(
+    phone: str,
+    args: dict,
+    receipt_bytes: bytes | None = None,
+) -> tuple[int | None, int | None]:
     """
     Создать заказ в БД и уведомить кассира.
-    Возвращает order_id.
+    Возвращает (order_id, tg_message_id).
     """
     from src import db  # отложенный импорт чтобы избежать цикла
 

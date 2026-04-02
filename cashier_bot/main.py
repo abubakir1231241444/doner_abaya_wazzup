@@ -44,7 +44,15 @@ def save_msg_map():
 # message_id → phone (для reply-bridge)
 _order_msg_map: dict[int, str] = load_msg_map()
 
-FASTAPI_BASE = "http://localhost:8001"
+FASTAPI_BASE = "http://localhost:8000"
+
+
+async def notify_cashier_touch(phone: str):
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{FASTAPI_BASE}/internal/cashier-touch/{phone}", timeout=5)
+    except Exception as e:
+        logger.warning(f"Failed to notify cashier touch for {phone}: {e}")
 
 # Постоянная клавиатура внизу экрана
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -252,8 +260,9 @@ async def cb_stats_period(cb: CallbackQuery):
     completed = [o for o in orders if o["status"] == "completed"]
     revenue = sum(o.get("total_sum", 0) for o in completed)
     avg = round(revenue / len(completed)) if completed else 0
-    deliveries = sum(1 for o in orders if o.get("delivery_type") == "our_delivery")
     takeaway = sum(1 for o in orders if o.get("delivery_type") == "takeaway")
+    in_cafe = sum(1 for o in orders if o.get("delivery_type") == "in_cafe")
+    client_courier = sum(1 for o in orders if o.get("delivery_type") == "client_courier")
 
     msg = (
         f"📊 <b>Аналитика: {label}</b>\n\n"
@@ -261,7 +270,7 @@ async def cb_stats_period(cb: CallbackQuery):
         f"✅ Выполнено: {len(completed)}\n"
         f"💰 Выручка: {revenue} тг\n"
         f"💳 Средний чек: {avg} тг\n\n"
-        f"🛵 Доставка: {deliveries}  |  🏠 Самовывоз: {takeaway}"
+        f"🏠 Самовывоз: {takeaway}  |  🍽 В кафе: {in_cafe}  |  🚗 Свой курьер: {client_courier}"
     )
     await cb.message.answer(msg, parse_mode=ParseMode.HTML)
     await cb.answer()
@@ -393,6 +402,7 @@ async def accept_order(cb: CallbackQuery):
     dtype = order["delivery_type"] if order else "takeaway"
 
     # Уведомить клиента
+    await notify_cashier_touch(phone)
     await wz.send_message(phone, "Ваш заказ принят в работу! Готовим 🌯")
 
     # Убираем старый текст с кнопками Accept/Reject и заменяем на новый статус
@@ -435,6 +445,7 @@ async def accept_order(cb: CallbackQuery):
 async def delay_order(cb: CallbackQuery):
     parts = cb.data.split("_")
     phone = parts[2]
+    await notify_cashier_touch(phone)
     msg = "Приносим извинения, ваш заказ задерживается примерно на 10 минут. Мы уже очень торопимся! 🥙"
     await wz.send_message(phone, msg)
     await cb.answer("✅ Клиент уведомлен о задержке!")
@@ -456,6 +467,7 @@ async def ready_order(cb: CallbackQuery):
         "client_courier": "Ваш заказ готов! Передаём вашему курьеру 📦",
     }
     text = messages.get(dtype, "Ваш заказ готов! 🌯")
+    await notify_cashier_touch(phone)
     await wz.send_message(phone, text)
 
     # Убираем кнопку "Заказ готов" (чтобы не нажимать второй раз)
@@ -486,6 +498,7 @@ async def reject_order(cb: CallbackQuery):
 
     # Снять паузу с клиента
     db.set_user_paused(phone, False)
+    await notify_cashier_touch(phone)
     await wz.send_message(phone, "К сожалению, ваш заказ не удалось принять. Попробуйте оформить заново 🙂")
 
     original_text = get_ord_text(cb.message)
@@ -521,6 +534,7 @@ async def reply_bridge(msg: Message, bot: Bot):
 
     # Если ТЕКСТ
     if msg.text:
+        await notify_cashier_touch(phone)
         await wz.send_message(phone, msg.text)
         await msg.answer("✅ Текст отправлен в WhatsApp")
     
@@ -529,6 +543,7 @@ async def reply_bridge(msg: Message, bot: Bot):
         photo = msg.photo[-1]
         file_info = await bot.get_file(photo.file_id)
         file_url = f"https://api.telegram.org/file/bot{CASHIER_BOT_TOKEN}/{file_info.file_path}"
+        await notify_cashier_touch(phone)
         await wz.send_image(phone, file_url, caption="Фото вашего заказа! 🌯")
         await msg.answer("✅ Фото отправлено в WhatsApp")
 
@@ -551,6 +566,7 @@ async def complete_order(cb: CallbackQuery):
             "Нам очень важно ваше мнение. Пожалуйста, оставьте отзыв о нас в 2ГИС, "
             "это поможет нам стать лучше: https://2gis.kz/aktobe/firm/70000001101359951 ⭐"
         )
+        await notify_cashier_touch(phone)
         await wz.send_message(phone, success_msg)
 
     original_text = get_ord_text(cb.message)

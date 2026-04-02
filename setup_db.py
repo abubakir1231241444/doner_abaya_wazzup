@@ -17,7 +17,7 @@ def main():
     # Since Supabase anon key can't run DDL, we check if the tables exist
     # The user must run schema.sql in Supabase SQL Editor
 
-    tables = ['users', 'menu', 'orders', 'couriers', 'conversations']
+    tables = ['users', 'menu', 'orders', 'conversations']
     for t in tables:
         try:
             res = db.table(t).select("id").limit(1).execute()
