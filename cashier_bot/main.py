@@ -50,7 +50,7 @@ FASTAPI_BASE = "http://localhost:8001"
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Аналитика"), KeyboardButton(text="🛑 Стоп-лист")],
-        [KeyboardButton(text="📝 Меню")],
+        [KeyboardButton(text="📝 Меню"), KeyboardButton(text="⚙️ Настройки бота")],
     ],
     resize_keyboard=True,
     is_persistent=True
@@ -127,6 +127,71 @@ async def btn_menu(msg: Message):
 async def close_msg(cb: CallbackQuery):
     await cb.message.delete()
     await cb.answer()
+
+
+# ── НАСТРОЙКИ БОТА ────────────────────────────────────────
+
+@router.message(F.text == "⚙️ Настройки бота")
+async def btn_settings(msg: Message):
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{FASTAPI_BASE}/internal/state", timeout=5)
+            state = r.json() if r.status_code == 200 else {"bot_disabled": False, "juma_active": False}
+    except Exception as e:
+        logger.error(f"Failed to fetch state: {e}")
+        state = {"bot_disabled": False, "juma_active": False}
+
+    bot_disabled = state.get("bot_disabled", False)
+    juma_active = state.get("juma_active", False)
+
+    bot_text = "🟢 Бот: Включен" if not bot_disabled else "🔴 Бот: ВЫКЛЮЧЕН"
+    juma_text = "🕌 Жума-режим: Включен" if juma_active else "🕌 Жума-режим: Выключен"
+
+    kb = [
+        [InlineKeyboardButton(text=bot_text, callback_data=f"setstate_bot_{int(not bot_disabled)}")],
+        [InlineKeyboardButton(text=juma_text, callback_data=f"setstate_juma_{int(not juma_active)}")],
+        [InlineKeyboardButton(text="🔙 Закрыть", callback_data="close_msg")]
+    ]
+    await msg.answer("⚙️ <b>Настройки бота:</b>\nНажми на кнопку, чтобы изменить состояние.",
+                     reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+                     parse_mode=ParseMode.HTML)
+
+@router.callback_query(F.data.startswith("setstate_"))
+async def cb_setstate(cb: CallbackQuery):
+    parts = cb.data.split("_")
+    key_type = parts[1] # 'bot' or 'juma'
+    new_val = bool(int(parts[2]))
+
+    payload = {}
+    if key_type == "bot":
+        payload["bot_disabled"] = new_val
+    elif key_type == "juma":
+        payload["juma_active"] = new_val
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(f"{FASTAPI_BASE}/internal/state", json=payload, timeout=5)
+            state = r.json() if r.status_code == 200 else payload
+    except Exception as e:
+        logger.error(f"Failed to set state: {e}")
+        await cb.answer("Ошибка сохранения!")
+        return
+
+    # Обновляем UI
+    bot_disabled = state.get("bot_disabled", False)
+    juma_active = state.get("juma_active", False)
+
+    bot_text = "🟢 Бот: Включен" if not bot_disabled else "🔴 Бот: ВЫКЛЮЧЕН"
+    juma_text = "🕌 Жума-режим: Включен" if juma_active else "🕌 Жума-режим: Выключен"
+
+    kb = [
+        [InlineKeyboardButton(text=bot_text, callback_data=f"setstate_bot_{int(not bot_disabled)}")],
+        [InlineKeyboardButton(text=juma_text, callback_data=f"setstate_juma_{int(not juma_active)}")],
+        [InlineKeyboardButton(text="🔙 Закрыть", callback_data="close_msg")]
+    ]
+    await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.answer("Настройки обновлены!")
+
 
 
 # ── АНАЛИТИКА (расширенная) ───────────────────────

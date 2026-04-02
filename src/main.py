@@ -25,6 +25,7 @@ import asyncio
 import time
 import pytz
 from datetime import datetime
+import os
 
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
@@ -42,6 +43,38 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Донер на Абае — Wazzup Bot")
 
 tz_local = pytz.timezone(TZ)
+
+STATE_FILE = "state.json"
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"bot_disabled": False, "juma_active": False}
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.error(f"Failed to save state: {e}")
+
+global_state = load_state()
+
+def is_bot_disabled() -> bool:
+    return global_state.get("bot_disabled", False)
+
+def is_juma_time() -> bool:
+    if global_state.get("juma_active", False):
+        return True
+    now = datetime.now(pytz.timezone("Asia/Aqtobe"))
+    if now.weekday() == 4:  # Friday
+        m = now.hour * 60 + now.minute
+        if 13 * 60 <= m < 14 * 60 + 30:
+            return True
+    return False
 
 # ── ИН-МЕМОРИ СТРУКТУРЫ ───────────────────────────────────
 # Дедубликация сообщений: messageId → timestamp
@@ -287,7 +320,16 @@ def extract_message(data: dict) -> tuple[str, str, str | None, str | None, str, 
 async def process_message(phone: str, text: str, file_url: str | None, message_id: str | None, msg_type: str = "text"):
     """Основная логика обработки входящего сообщения от клиента."""
 
-    # 1. Проверка рабочих часов
+    # 1. Проверка состояния бота
+    if is_bot_disabled():
+        await wz.send_message(phone, "🙏 Извините за неудобства, у нас временные технические неполадки. Скоро всё исправим и вернемся к работе. Спасибо за понимание 🤍")
+        return
+
+    if is_juma_time():
+        await wz.send_message(phone, "🙏 Извините за неудобства, сейчас перерыв в честь Жума-намаза. Спасибо за понимание 🤍")
+        return
+
+    # 1.2 Проверка рабочих часов
     if not is_working_hours():
         await wz.send_message(phone, "Мы сейчас закрыты 🙁 Работаем с 10:00 до 02:00 ночи. Ждём вас в рабочее время! 🌯")
         return
@@ -562,3 +604,15 @@ async def webhook_info():
     """Посмотреть текущий зарегистрированный вебхук в Wazzup."""
     info = await wz.get_webhook_info()
     return info
+
+@app.get("/internal/state")
+async def get_state_endpoint():
+    return global_state
+
+@app.post("/internal/state")
+async def set_state_endpoint(request: Request):
+    data = await request.json()
+    global_state.update(data)
+    save_state(global_state)
+    return global_state
+
