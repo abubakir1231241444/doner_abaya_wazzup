@@ -458,11 +458,28 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
             )
             continue
 
-        # 2. Игнорируем ВСЕ не-client сообщения (manager, bot, system и т.д.)
+        # 2. Исходящие сообщения (наши собственные) — просто игнорируем
+        #    Wazzup возвращает вебхук для КАЖДОГО отправленного нами сообщения
+        #    с status != "inbound". Это НЕ кассир пишет, это эхо бота.
+        if status != "inbound":
+            logger.info(f"Ignoring outbound echo (status={status}) for {phone}")
+            if message_id and text:
+                db.save_wazzup_message(message_id, phone, text, True)
+            continue
+
+        # 3. Эхо-детекция (хеш текста + кулдаун после отправки)
+        if text and wz.is_echo(phone, text):
+            logger.info(f"Ignoring echo from {phone}")
+            if message_id:
+                db.save_wazzup_message(message_id, phone, text, True)
+            continue
+
+        # 4. Не-client сообщения (когда кассир РЕАЛЬНО пишет вручную в Wazzup Web)
+        #    Такие сообщения приходят с status=inbound и authorType=user/manager
         if author_type != "client":
-            logger.info(f"Ignoring non-client message (authorType={author_type}) for {phone}")
+            logger.info(f"Non-client message (authorType={author_type}) for {phone}")
             
-            # Если это кассир ответил напрямую с WhatsApp / Wazzup Web
+            # Кассир ответил напрямую — ставим бота на паузу
             if author_type in ("user", "manager"):
                 if not db.is_user_paused(phone):
                     db.set_user_paused(phone, True)
@@ -474,13 +491,6 @@ async def handle_webhook(request: Request, bg_tasks: BackgroundTasks):
                         logger.error(f"Error sending pause alert to TG: {e}")
 
             if message_id and text:
-                db.save_wazzup_message(message_id, phone, text, True)
-            continue
-
-        # Эхо-детекция (хеш текста + кулдаун после отправки)
-        if text and wz.is_echo(phone, text):
-            logger.info(f"Ignoring echo from {phone}")
-            if message_id:
                 db.save_wazzup_message(message_id, phone, text, True)
             continue
 
